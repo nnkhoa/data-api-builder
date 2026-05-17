@@ -104,6 +104,44 @@ public class ClientRoleHeaderAuthenticationMiddleware
         if (isAuthenticatedRequest)
         {
             clientDefinedRole = AUTHENTICATED_ROLE;
+
+            // Auto-extract role from JWT claims when no X-MS-API-ROLE header is provided.
+            // Checks: 1) top-level "roles" claim (string array)
+            //         2) "realm_access.roles" nested claim (fallback)
+            // Uses the first role found; falls back to "Authenticated" if none found.
+            if (!httpContext.Request.Headers.ContainsKey(AuthorizationResolver.CLIENT_ROLE_HEADER))
+            {
+                // Try top-level "roles" claim
+                Claim? rolesClaim = httpContext.User.Claims.FirstOrDefault(c => c.Type == "roles");
+                if (rolesClaim != null)
+                {
+                    clientDefinedRole = rolesClaim.Value;
+                }
+                else
+                {
+                    // Fallback: try realm_access.roles (nested JSON claim)
+                    Claim? realmAccessClaim = httpContext.User.Claims.FirstOrDefault(c => c.Type == "realm_access");
+                    if (realmAccessClaim != null)
+                    {
+                        try
+                        {
+                            using System.Text.Json.JsonDocument doc = System.Text.Json.JsonDocument.Parse(realmAccessClaim.Value);
+                            if (doc.RootElement.TryGetProperty("roles", out System.Text.Json.JsonElement rolesElement))
+                            {
+                                foreach (System.Text.Json.JsonElement role in rolesElement.EnumerateArray())
+                                {
+                                    clientDefinedRole = role.GetString() ?? AUTHENTICATED_ROLE;
+                                    break; // Use first role only
+                                }
+                            }
+                        }
+                        catch (System.Text.Json.JsonException)
+                        {
+                            // Malformed claim — keep AUTHENTICATED_ROLE fallback
+                        }
+                    }
+                }
+            }
         }
 
         // Attempt to inject CLIENT_ROLE_HEADER:clientDefinedRole into the httpContext
@@ -204,10 +242,11 @@ public class ClientRoleHeaderAuthenticationMiddleware
         }
         else
         {
-            // Changing this value is a breaking change because non-out of box
-            // authentication provider names supplied in dab-config.json indicate
-            // that JWT bearer authentication should be used.
-            return GenericOAuthDefaults.AUTHENTICATIONSCHEME;
+            // FIX #2820: The original code returned GenericOAuthDefaults.AUTHENTICATIONSCHEME ("OAuthAuthentication"),
+            // but no authentication handler is registered with that scheme name when using Jwt/Custom provider.
+            // Startup.cs registers JwtBearerDefaults.AuthenticationScheme ("Bearer") for these providers.
+            // Non-out-of-box provider names in dab-config.json indicate JWT bearer authentication should be used.
+            return JwtBearerDefaults.AuthenticationScheme;
         }
     }
 }
